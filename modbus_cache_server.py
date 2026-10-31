@@ -20,9 +20,13 @@ Configuration is via environment variables:
     LISTEN_HOST         address to serve on               (default 0.0.0.0)
     LISTEN_PORT         port to serve on                  (default 5502)
     POLL_INTERVAL       seconds between polls             (default 10)
+    MAX_PV_KW           limit for PV counter growth, kW   (default 20)
+    SESSION_INIT_DELAY  wait after connecting, seconds    (default 1.5)
     LOG_LEVEL           INFO / DEBUG / WARNING            (default INFO)
 """
 
+import itertools
+from datetime import datetime
 import asyncio
 import logging
 import os
@@ -38,6 +42,8 @@ DEVICE_ID = int(os.environ.get("SUN2000_UNIT_ID", 1))
 SERVER_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("LISTEN_PORT", 5502))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 10))
+MAX_PV_KW = float(os.environ.get("MAX_PV_KW", 20))  # plausibility limit, above any real output
+SESSION_INIT_DELAY = float(os.environ.get("SESSION_INIT_DELAY", 1.5))
 
 if not SDONGLE_HOST:
     raise SystemExit(
@@ -78,46 +84,108 @@ logger = logging.getLogger("modbus_cache")
 register_cache = {}
 cache_lock = asyncio.Lock()
 last_update = 0
+batch_updated = {}
+yield_values = {}
+pending_yield = {}
+transaction_ids = itertools.count(0)
+MAX_CACHE_AGE = 120
+REBASE_READS = 3  # Consistent reads needed before a counter may move to a new baseline.
+
+
+def next_transaction_id():
+    """1..65535: the dongle sends an unsolicited frame with id 0 on every new connection."""
+    return next(transaction_ids) % 65535 + 1
+
+
+class InvalidResponse(Exception):
+    """The connection cannot safely be used for another request."""
+
+
+async def read_response(reader, transaction_id, unit_id, function, data_size):
+    """Read exactly one validated Modbus ADU, even across TCP fragments."""
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        header = await asyncio.wait_for(reader.readexactly(7), timeout=remaining)
+        tx, protocol, length, unit = struct.unpack(">HHHB", header)
+        if protocol != 0 or not 2 <= length <= 254:
+            raise InvalidResponse(f"Invalid Modbus header: {header.hex()}")
+        pdu = await asyncio.wait_for(reader.readexactly(length - 1), timeout=max(.01, deadline-asyncio.get_running_loop().time()))
+        if (tx, unit) == (transaction_id, unit_id):
+            break
+        logger.warning("Discarding unrelated Modbus reply tx=%s unit=%s; expected tx=%s unit=%s", tx, unit, transaction_id, unit_id)
+    if pdu[0] == function | 0x80 and len(pdu) == 2:
+        return None  # A complete exception response does not desynchronize TCP.
+    if pdu[0] != function or len(pdu) != data_size:
+        raise InvalidResponse("Unexpected Modbus function or response size")
+    return pdu
+
+
+def valid_yield(start, values, stamp=None):
+    """Reject impossible PV counters before either HA instance sees them."""
+    if start not in (32106, 32114):
+        return True
+    stamp = time.time() if stamp is None else stamp
+    value = ((values[0] << 16) | values[1]) / 100
+    day = datetime.fromtimestamp(stamp).date()
+    if not 0 <= value <= (10_000_000 if start == 32106 else 250):
+        return False
+    previous = yield_values.get(start)
+    if previous:
+        old, old_stamp, old_day = previous
+        if start == 32106 or day == old_day:
+            # MAX_PV_KW is a generous upper limit; allow rounding as well.
+            if value < old or value - old > 0.1 + MAX_PV_KW * (stamp - old_stamp) / 3600:
+                return confirm_new_baseline(start, value, stamp, day)
+    pending_yield.pop(start, None)
+    yield_values[start] = (value, stamp, day)
+    return True
+
+
+def confirm_new_baseline(start, value, stamp, day):
+    """Accept a rejected counter only after several consistent reads.
+
+    A single wrong reply stays rejected. Without this, a wrong first read after a
+    restart, or an inverter resetting its daily counter just after local midnight,
+    would block the register until the value caught up again.
+    """
+    last = pending_yield.get(start)
+    count = 1
+    if last and 0 <= value - last[0] <= 0.1 + MAX_PV_KW * (stamp - last[1]) / 3600:
+        count = last[2] + 1
+    if count < REBASE_READS:
+        pending_yield[start] = (value, stamp, count)
+        return False
+    logger.warning("PV counter at %s moved to new baseline %.2f", start, value)
+    pending_yield.pop(start, None)
+    yield_values[start] = (value, stamp, day)
+    return True
 
 
 def init_cache():
-    """Initialize all register addresses with 0."""
-    for start, count in REGISTER_BATCHES:
-        for i in range(count):
-            register_cache[start + i] = 0
+    """Uninitialized registers stay absent instead of inventing zero counters."""
+    register_cache.clear()
+    batch_updated.clear()
+    yield_values.clear()
+    pending_yield.clear()
 
 
 # === SDongle Reader ===
 async def read_batch(reader, writer, start, count):
     """Read a single register batch. Returns list of values or None."""
-    req = struct.pack(">HHHBBHH", 0, 0, 6, DEVICE_ID, 3, start, count)
+    tx = next_transaction_id()
+    req = struct.pack(">HHHBBHH", tx, 0, 6, DEVICE_ID, 3, start, count)
     writer.write(req)
     await writer.drain()
 
-    # Read full response in one go (max 9 header + 125*2 data)
-    resp = await asyncio.wait_for(reader.read(9 + count * 2), timeout=3)
-
-    if len(resp) < 9:
+    pdu = await read_response(reader, tx, DEVICE_ID, 3, 2 + count * 2)
+    if pdu is None:
         return None
-
-    resp_tx, resp_proto, resp_len, resp_unit, resp_fc, byte_count = struct.unpack(
-        ">HHHBBB", resp[:9]
-    )
-
-    if resp_fc >= 0x80:  # Exception
-        return None
-
-    data = resp[9:]
-    # If we didn't get all data yet, read more
-    while len(data) < byte_count:
-        more = await asyncio.wait_for(reader.read(byte_count - len(data)), timeout=2)
-        if not more:
-            break
-        data += more
-
-    if len(data) >= count * 2:
-        return struct.unpack(">" + "H" * count, data[:count * 2])
-    return None
+    if pdu[1] != count * 2:
+        raise InvalidResponse("Unexpected register byte count")
+    return struct.unpack(">" + "H" * count, pdu[2:])
 
 
 async def read_sdongle():
@@ -133,22 +201,30 @@ async def read_sdongle():
 
     success_count = 0
     fail_count = 0
+    # The SDongle needs time to initialize its Modbus session after TCP connect.
+    await asyncio.sleep(SESSION_INIT_DELAY)
 
     for start, count in REGISTER_BATCHES:
         try:
             values = await read_batch(reader, writer, start, count)
             if values:
+                if not valid_yield(start, values):
+                    logger.warning("Rejected implausible PV counter at %s", start)
+                    fail_count += 1
+                    continue
                 async with cache_lock:
                     for i, val in enumerate(values):
                         register_cache[start + i] = val
+                    batch_updated[start] = time.time()
                 success_count += 1
             else:
                 fail_count += 1
             await asyncio.sleep(0.05)  # 50ms between reads
         except asyncio.TimeoutError:
             fail_count += 1
+            break  # Late replies must never be consumed by the next request.
         except Exception as e:
-            logger.warning(f"Error reading {start}: {type(e).__name__}")
+            logger.warning(f"Error reading {start}: {type(e).__name__}: {e}")
             fail_count += 1
             break  # Connection likely broken, exit loop
 
@@ -193,14 +269,14 @@ async def handle_client(client_reader, client_writer):
     try:
         while True:
             # Read MBAP header (7 bytes)
-            header = await asyncio.wait_for(client_reader.read(7), timeout=60)
-            if len(header) < 7:
-                break  # Client disconnected
+            header = await asyncio.wait_for(client_reader.readexactly(7), timeout=60)
 
             tx_id, proto, length, unit_id = struct.unpack(">HHHB", header)
+            if proto != 0 or not 2 <= length <= 254:
+                break
 
             # Read remaining PDU
-            pdu = await asyncio.wait_for(client_reader.read(length - 1), timeout=5)
+            pdu = await asyncio.wait_for(client_reader.readexactly(length - 1), timeout=5)
             if len(pdu) < 1:
                 break
 
@@ -209,13 +285,28 @@ async def handle_client(client_reader, client_writer):
             if fc == 3 and len(pdu) >= 5:
                 # FC3: Read Holding Registers
                 reg_addr, reg_count = struct.unpack(">HH", pdu[1:5])
+                if not 1 <= reg_count <= 125:
+                    break
 
                 # Serve from cache
                 values = []
                 async with cache_lock:
+                    fresh = all(
+                        key in register_cache and any(
+                            start <= key < start + count
+                            and time.time() - batch_updated.get(start, 0) <= MAX_CACHE_AGE
+                            for start, count in REGISTER_BATCHES
+                        )
+                        for key in range(reg_addr, reg_addr + reg_count)
+                    )
                     for i in range(reg_count):
                         addr_key = reg_addr + i
                         values.append(register_cache.get(addr_key, 0))
+                if not fresh:
+                    resp_pdu = bytes([0x83, 11])  # Gateway target unavailable.
+                    client_writer.write(struct.pack(">HHHB", tx_id, 0, 3, unit_id) + resp_pdu)
+                    await client_writer.drain()
+                    continue
 
                 # Build response
                 byte_count = reg_count * 2
@@ -255,6 +346,8 @@ async def handle_client(client_reader, client_writer):
         pass  # Client idle timeout
     except ConnectionResetError:
         pass
+    except asyncio.IncompleteReadError:
+        pass
     except Exception as e:
         logger.warning(f"Client {addr} error: {type(e).__name__}: {e}")
     finally:
@@ -268,20 +361,19 @@ async def handle_client(client_reader, client_writer):
 
 async def forward_write(tx_id, unit_id, reg_addr, reg_value):
     """Forward a write request directly to the SDongle."""
+    writer = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(SDONGLE_HOST, SDONGLE_PORT),
             timeout=10,
         )
-        req = struct.pack(">HHHBBHH", 0, 0, 6, unit_id, 6, reg_addr, reg_value)
+        upstream_tx = next_transaction_id()
+        req = struct.pack(">HHHBBHH", upstream_tx, 0, 6, unit_id, 6, reg_addr, reg_value)
         writer.write(req)
         await writer.drain()
 
-        resp = await asyncio.wait_for(reader.read(12), timeout=10)
-        writer.close()
-        await writer.wait_closed()
-
-        if len(resp) >= 12:
+        resp = await read_response(reader, upstream_tx, unit_id, 6, 5)
+        if resp == struct.pack(">BHH", 6, reg_addr, reg_value):
             logger.info(f"Write forwarded OK: register {reg_addr} = {reg_value}")
             return True
         else:
@@ -291,6 +383,13 @@ async def forward_write(tx_id, unit_id, reg_addr, reg_value):
     except Exception as e:
         logger.warning(f"Write forward failed: {type(e).__name__}: {e}")
         return False
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 # === Main ===
