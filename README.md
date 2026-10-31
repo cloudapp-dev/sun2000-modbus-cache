@@ -87,6 +87,8 @@ All configuration is via environment variables:
 | `LISTEN_HOST` | `0.0.0.0` | Address to serve on |
 | `LISTEN_PORT` | `5502` | Port to serve on |
 | `POLL_INTERVAL` | `10` | Seconds between inverter polls |
+| `MAX_PV_KW` | `20` | Limit for PV counter growth in kW, set it above your real output |
+| `SESSION_INIT_DELAY` | `1.5` | Seconds to wait after connecting before the first request |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for per-batch detail |
 
 ### Registers
